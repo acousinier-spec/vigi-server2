@@ -1,0 +1,22 @@
+Déploiement serveur Vigi Messenger
+
+Le .exe seul ne peut pas créer une adresse Internet publique. Pour connecter deux PC à distance, déploie ce dossier server/ sur Render, Railway, VPS, etc.
+
+Commandes serveur:
+npm install
+npm start
+
+Variables:
+PORT=3000
+
+Une fois déployé, copie l'URL publique, par exemple:
+https://vigi-messenger-server.onrender.com
+
+Dans le .exe:
+1. Colle l'URL serveur
+2. Clique Sauver serveur
+3. Mets le même code salon sur les deux PC
+4. Clique Connecter distance
+5. Lance Appel vidéo
+
+Note: pour certains réseaux très stricts, ajoute un serveur TURN dans app/index.html, section iceServers.
