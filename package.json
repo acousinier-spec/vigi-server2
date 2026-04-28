@@ -1,5 +1,5 @@
 {
-  "name": "vigi-messenger-render-server",
+  "name": "vigi-server2",
   "version": "1.0.0",
   "private": true,
   "main": "server.js",
