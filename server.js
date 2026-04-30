@@ -199,11 +199,50 @@ async function initStore() {
 
 async function main() {
   store = await initStore();
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return sendHttp(res, 204, '');
-    if (req.url === '/health' || req.url === '/' || req.url === '/ws') {
-      return sendHttp(res, 200, `Vigi Messenger signaling server OK\nWebSocket: ready on /ws\nAccounts: enabled\nContacts: synchronized\nStorage: ${MONGO_URI ? 'MongoDB persistent' : 'local fallback'}\n`);
+    const pathname = (req.url || '/').split('?')[0];
+
+    if (req.method === 'GET' && (pathname === '/health' || pathname === '/' || pathname === '/ws')) {
+      return sendHttp(res, 200, `Vigi Messenger signaling server OK\nWebSocket: ready on /ws\nAccounts: enabled\nContacts: synchronized\nStorage: ${MONGO_URI ? 'MongoDB persistent' : 'local fallback'}\nLiveKit: ${liveKitConfigured() ? 'configured' : 'not configured'}\n`);
     }
+
+    if (req.method === 'POST' && pathname === '/api/livekit/token') {
+      try {
+        if (!liveKitConfigured()) {
+          return sendJson(res, 503, {
+            message: 'LiveKit non configuré sur Render. Ajoute LIVEKIT_URL, LIVEKIT_API_KEY et LIVEKIT_API_SECRET dans Environment.'
+          });
+        }
+
+        const user = await userFromAuth(req);
+        if (!user) return sendJson(res, 401, { message: 'Session expirée. Reconnecte-toi.' });
+
+        const body = await readJson(req);
+        const roomName = sanitizeRoomName(body.roomName || ('vigi-room-' + Date.now()));
+        const displayName = cleanName(body.displayName || user.name, user.name || 'Utilisateur');
+        const AccessToken = await getLiveKitAccessTokenClass();
+        const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+          identity: user.email,
+          name: displayName
+        });
+
+        at.addGrant({
+          room: roomName,
+          roomJoin: true,
+          canPublish: true,
+          canSubscribe: true,
+          canPublishData: true
+        });
+
+        const token = await at.toJwt();
+        return sendJson(res, 200, { url: LIVEKIT_URL, token, roomName });
+      } catch (e) {
+        console.error('LiveKit token error:', e);
+        return sendJson(res, 500, { message: 'Erreur token LiveKit: ' + (e.message || e) });
+      }
+    }
+
     return sendHttp(res, 404, 'Not found\n');
   });
 
