@@ -6,6 +6,8 @@ const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { MongoClient } = require('mongodb');
+let LiveKitAccessToken = null;
+try { ({ AccessToken: LiveKitAccessToken } = require('livekit-server-sdk')); } catch (e) { /* ESM fallback chargé à la demande */ }
 
 const port = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'CHANGE_ME_RENDER_SECRET_' + crypto.randomBytes(16).toString('hex');
@@ -13,6 +15,15 @@ const MONGO_URI = process.env.MONGO_URI || '';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'vigi-data.json');
 const MAX_PARTICIPANTS = 12;
 const HISTORY_LIMIT = 100;
+const LIVEKIT_URL = process.env.LIVEKIT_URL || '';
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || '';
+function liveKitConfigured(){ return !!(LIVEKIT_URL && LIVEKIT_API_KEY && LIVEKIT_API_SECRET); }
+async function getLiveKitAccessTokenClass(){
+  if (LiveKitAccessToken) return LiveKitAccessToken;
+  try { const mod = await import('livekit-server-sdk'); LiveKitAccessToken = mod.AccessToken; return LiveKitAccessToken; }
+  catch (e) { throw new Error('LiveKit SDK absent. Lance npm install après avoir mis à jour package.json.'); }
+}
 
 const rooms = new Map();
 let store;
@@ -43,11 +54,33 @@ function sendHttp(res, code, body, type = 'text/plain; charset=utf-8') {
   res.writeHead(code, {
     'Content-Type': type,
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization'
   });
   res.end(body);
 }
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', chunk => {
+      data += chunk;
+      if (data.length > 1024 * 1024) reject(new Error('Payload trop volumineux'));
+    });
+    req.on('end', () => {
+      try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new Error('JSON invalide')); }
+    });
+    req.on('error', reject);
+  });
+}
+function sendJson(res, code, obj) { return sendHttp(res, code, JSON.stringify(obj), 'application/json; charset=utf-8'); }
+async function userFromAuth(req) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const decoded = verifyToken(token);
+  if (!decoded?.email) return null;
+  return await store.getUser(cleanEmail(decoded.email));
+}
+function sanitizeRoomName(v) { return String(v || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '').slice(0, 120) || ('vigi-' + Date.now()); }
 function id() { return crypto.randomBytes(4).toString('hex'); }
 function send(ws, payload) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload)); }
 function publicClient(c) { return { id: c.id, name: c.name, email: c.email || '', role: c.role || 'user' }; }
@@ -246,7 +279,7 @@ async function main() {
           leave(client);
           const room = safeString(msg.room, 'levigilant');
           const members = roomMembers(room);
-          if (members.length >= MAX_PARTICIPANTS) return send(ws, { type: 'room-full', maxParticipants: MAX_PARTICIPANTS });
+          if (members.length >= MAX_PARTICIPANTS && !room.startsWith('vigi-presence')) return send(ws, { type: 'room-full', maxParticipants: MAX_PARTICIPANTS });
           client.room = room; client.name = client.user.name; client.email = client.user.email; client.role = msg.role === 'admin' ? 'admin' : 'user';
           if (!rooms.has(room)) rooms.set(room, new Map());
           rooms.get(room).set(client.id, client);
