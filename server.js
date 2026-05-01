@@ -175,6 +175,21 @@ class FileStore {
     return c;
   }
   async getConferences(email) { const u = this.db.users[email]; return Array.isArray(u?.conferences) ? u.conferences : []; }
+  async deleteConferenceForUsers(ownerEmail, conferenceId) {
+    const owner = cleanEmail(ownerEmail);
+    const id = String(conferenceId || '');
+    if (!id) return;
+    const ownerUser = this.db.users[owner];
+    const existing = ownerUser?.conferences?.find(c => String(c.conferenceId || c.id || '') === id);
+    const participants = Array.isArray(existing?.participants) ? existing.participants : [];
+    const targets = [...new Set([owner, ...participants].filter(Boolean))];
+    for (const email of targets) {
+      const u = this.db.users[email];
+      if (!u) continue;
+      u.conferences = (u.conferences || []).filter(c => String(c.conferenceId || c.id || '') !== id);
+    }
+    this.save();
+  }
 }
 
 
@@ -229,6 +244,21 @@ class MongoStore {
     return c;
   }
   async getConferences(email) { const user = await this.getUser(email); return Array.isArray(user?.conferences) ? user.conferences : []; }
+  async deleteConferenceForUsers(ownerEmail, conferenceId) {
+    const owner = cleanEmail(ownerEmail);
+    const id = String(conferenceId || '');
+    if (!id) return;
+    const ownerUser = await this.getUser(owner);
+    const existing = ownerUser?.conferences?.find(c => String(c.conferenceId || c.id || '') === id);
+    const participants = Array.isArray(existing?.participants) ? existing.participants : [];
+    const targets = [...new Set([owner, ...participants].filter(Boolean))];
+    for (const email of targets) {
+      const user = await this.getUser(email);
+      if (!user) continue;
+      const conferences = (user.conferences || []).filter(c => String(c.conferenceId || c.id || '') !== id);
+      await this.users.updateOne({ email }, { $set: { conferences } });
+    }
+  }
 }
 
 
@@ -361,7 +391,21 @@ async function main() {
           return send(ws, { type: 'conference-list', conferences: await store.getConferences(client.user.email) });
         }
         if (msg.type === 'conference-save') {
-          await store.saveConferenceForUsers({ ...(msg.conference || {}), ownerEmail: client.user.email });
+          const conf = { ...(msg.conference || {}), ownerEmail: client.user.email };
+          await store.saveConferenceForUsers(conf);
+          const targetEmails = [...new Set([cleanEmail(conf.ownerEmail), ...(Array.isArray(conf.participants) ? conf.participants.map(cleanEmail) : [])].filter(Boolean))];
+          for (const email of targetEmails) {
+            for (const other of clients.values()) {
+              if (cleanEmail(other?.user?.email) === email) send(other.ws, { type: 'conference-updated', conference: conf });
+            }
+          }
+          return send(ws, { type: 'conference-list', conferences: await store.getConferences(client.user.email) });
+        }
+        if (msg.type === 'conference-delete') {
+          await store.deleteConferenceForUsers(cleanEmail(client.user.email), String(msg.conferenceId || ''));
+          for (const other of clients.values()) {
+            if (other?.user?.email) send(other.ws, { type: 'conference-deleted', conferenceId: String(msg.conferenceId || '') });
+          }
           return send(ws, { type: 'conference-list', conferences: await store.getConferences(client.user.email) });
         }
         if (msg.type === 'history-get') {
