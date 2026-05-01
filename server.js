@@ -32,7 +32,7 @@ function cleanEmail(v) { return String(v || '').trim().toLowerCase().slice(0, 16
 function cleanName(v, fallback = 'Utilisateur') { return String(v || fallback).trim().slice(0, 80) || fallback; }
 function cleanId(v) { return String(v || ('contact_' + Date.now() + '_' + crypto.randomBytes(3).toString('hex'))).slice(0, 120); }
 function safeString(value, fallback = '') { return String(value || fallback).slice(0, 200); }
-function publicUser(u) { return { email: u.email, name: u.name, contacts: Array.isArray(u.contacts) ? u.contacts : [] }; }
+function publicUser(u) { return { email: u.email, name: u.name, contacts: Array.isArray(u.contacts) ? u.contacts : [], conferences: Array.isArray(u.conferences) ? u.conferences : [] }; }
 function normalizeContact(c) {
   return {
     id: cleanId(c.id),
@@ -46,6 +46,21 @@ function normalizeContact(c) {
   };
 }
 function contactKey(c) { return String(c?.email || c?.id || c?.name || '').toLowerCase(); }
+function normalizeConference(conf) {
+  const participants = Array.isArray(conf?.participants) ? conf.participants.map(cleanEmail).filter(Boolean) : [];
+  const conferenceId = safeString(conf?.conferenceId || conf?.id || ('conf_' + Date.now()));
+  return {
+    conferenceId,
+    id: conferenceId,
+    kind: 'conference',
+    name: cleanName(conf?.name, 'Conférence'),
+    ownerEmail: cleanEmail(conf?.ownerEmail),
+    participants: [...new Set(participants)],
+    active: !!conf?.active,
+    livekitRoom: safeString(conf?.livekitRoom || ''),
+    createdAt: conf?.createdAt || new Date().toISOString()
+  };
+}
 function conversationKey(room, senderEmail, targetEmail) {
   if (targetEmail) return ['dm', room, senderEmail, targetEmail].sort().join('::');
   return 'room::' + room;
@@ -115,10 +130,11 @@ class FileStore {
     catch (e) { console.error('Impossible de charger la base locale:', e.message); }
     if (!this.db.users) this.db.users = {};
     if (!Array.isArray(this.db.messages)) this.db.messages = [];
+    for (const email of Object.keys(this.db.users)) { if (!Array.isArray(this.db.users[email].conferences)) this.db.users[email].conferences = []; }
   }
   save() { try { fs.writeFileSync(this.file, JSON.stringify(this.db, null, 2)); } catch (e) { console.error('Sauvegarde locale impossible:', e.message); } }
   async getUser(email) { return this.db.users[email] || null; }
-  async createUser(user) { this.db.users[user.email] = user; this.save(); return user; }
+  async createUser(user) { if (!Array.isArray(user.conferences)) user.conferences = []; this.db.users[user.email] = user; this.save(); return user; }
   async updateUser(email, patch) { const u = this.db.users[email]; if (!u) return null; Object.assign(u, patch); this.save(); return u; }
   async upsertContact(email, contact) {
     const u = this.db.users[email]; if (!u) return [];
@@ -144,7 +160,23 @@ class FileStore {
   }
   async saveMessage(msg) { this.db.messages.push(msg); if (this.db.messages.length > 5000) this.db.messages = this.db.messages.slice(-5000); this.save(); return msg; }
   async history(key) { return this.db.messages.filter(m => m.conversation === key).slice(-HISTORY_LIMIT); }
+  async saveConferenceForUsers(conf) {
+    const c = normalizeConference(conf);
+    const targets = [...new Set([c.ownerEmail, ...c.participants].filter(Boolean))];
+    for (const email of targets) {
+      const u = this.db.users[email];
+      if (!u) continue;
+      u.conferences = Array.isArray(u.conferences) ? u.conferences : [];
+      const idx = u.conferences.findIndex(x => x.conferenceId === c.conferenceId);
+      if (idx >= 0) u.conferences[idx] = { ...u.conferences[idx], ...c };
+      else u.conferences.push(c);
+    }
+    this.save();
+    return c;
+  }
+  async getConferences(email) { const u = this.db.users[email]; return Array.isArray(u?.conferences) ? u.conferences : []; }
 }
+
 
 class MongoStore {
   constructor(client) { this.client = client; this.db = client.db(process.env.MONGO_DB || 'vigi_messenger'); this.users = this.db.collection('users'); this.messages = this.db.collection('messages'); }
@@ -182,7 +214,23 @@ class MongoStore {
   }
   async saveMessage(msg) { await this.messages.insertOne(msg); return msg; }
   async history(key) { return await this.messages.find({ conversation: key }).sort({ createdAt: -1 }).limit(HISTORY_LIMIT).toArray().then(a => a.reverse()); }
+  async saveConferenceForUsers(conf) {
+    const c = normalizeConference(conf);
+    const targets = [...new Set([c.ownerEmail, ...c.participants].filter(Boolean))];
+    for (const email of targets) {
+      const user = await this.getUser(email);
+      if (!user) continue;
+      const conferences = Array.isArray(user.conferences) ? user.conferences : [];
+      const idx = conferences.findIndex(x => x.conferenceId === c.conferenceId);
+      if (idx >= 0) conferences[idx] = { ...conferences[idx], ...c };
+      else conferences.push(c);
+      await this.users.updateOne({ email }, { $set: { conferences } });
+    }
+    return c;
+  }
+  async getConferences(email) { const user = await this.getUser(email); return Array.isArray(user?.conferences) ? user.conferences : []; }
 }
+
 
 async function initStore() {
   if (MONGO_URI) {
@@ -276,7 +324,7 @@ async function main() {
           if (password.length < 6) return send(ws, { type: 'auth-error', message: 'Mot de passe trop court (minimum 6 caractères).' });
           if (await store.getUser(email)) return send(ws, { type: 'auth-error', message: 'Ce compte existe déjà. Connecte-toi.' });
           const passwordHash = await bcrypt.hash(password, 12);
-          const user = { email, name, passwordHash, contacts: [], createdAt: new Date(), updatedAt: new Date() };
+          const user = { email, name, passwordHash, contacts: [], conferences: [], createdAt: new Date(), updatedAt: new Date() };
           await store.createUser(user);
           return authOk(client, ws, user);
         }
@@ -308,6 +356,13 @@ async function main() {
           const user = await store.getUser(client.user.email);
           client.user = user;
           return send(ws, { type: 'contact-list', contacts: user?.contacts || [] });
+        }
+        if (msg.type === 'conferences-get') {
+          return send(ws, { type: 'conference-list', conferences: await store.getConferences(client.user.email) });
+        }
+        if (msg.type === 'conference-save') {
+          await store.saveConferenceForUsers({ ...(msg.conference || {}), ownerEmail: client.user.email });
+          return send(ws, { type: 'conference-list', conferences: await store.getConferences(client.user.email) });
         }
         if (msg.type === 'history-get') {
           const key = safeString(msg.conversation || conversationKey(safeString(msg.room, client.room || 'levigilant'), client.email, cleanEmail(msg.targetEmail)));
