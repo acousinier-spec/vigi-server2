@@ -177,8 +177,8 @@ class FileStore {
   }
   async getConferences(email) { const u = this.db.users[email]; return Array.isArray(u?.conferences) ? u.conferences : []; }
   async removeConferenceForUser(email, conferenceId) {
-    const u = this.db.users[email]; if (!u) return [];
-    u.conferences = (u.conferences || []).filter(c => c.conferenceId !== conferenceId);
+    const u = this.db.users[email]; if(!u) return [];
+    u.conferences = (u.conferences || []).filter(c => String(c.conferenceId || c.id || '') !== String(conferenceId || ''));
     this.save(); return u.conferences;
   }
 }
@@ -236,8 +236,8 @@ class MongoStore {
   }
   async getConferences(email) { const user = await this.getUser(email); return Array.isArray(user?.conferences) ? user.conferences : []; }
   async removeConferenceForUser(email, conferenceId) {
-    const user = await this.getUser(email); if (!user) return [];
-    const conferences = (user.conferences || []).filter(c => c.conferenceId !== conferenceId);
+    const user = await this.getUser(email); if(!user) return [];
+    const conferences = (user.conferences || []).filter(c => String(c.conferenceId || c.id || '') !== String(conferenceId || ''));
     await this.users.updateOne({ email }, { $set: { conferences } });
     return conferences;
   }
@@ -362,16 +362,8 @@ async function main() {
           return;
         }
         if (msg.type === 'contact-add') return send(ws, { type: 'contact-list', contacts: await store.upsertContact(client.user.email, msg.contact || {}) });
-        if (msg.type === 'contact-delete') {
-          const contactId = String(msg.contactId || '');
-          if (cleanEmail(contactId) === ADMIN_EMAIL) return send(ws, { type: 'contact-list', contacts: await store.getUser(client.user.email).then(u => u?.contacts || []) });
-          return send(ws, { type: 'contact-list', contacts: await store.removeContact(client.user.email, contactId) });
-        }
-        if (msg.type === 'contact-block') {
-          const contactId = String(msg.contactId || '');
-          if (cleanEmail(contactId) === ADMIN_EMAIL) return send(ws, { type: 'contact-list', contacts: await store.getUser(client.user.email).then(u => u?.contacts || []) });
-          return send(ws, { type: 'contact-list', contacts: await store.blockContact(client.user.email, contactId, !!msg.blocked) });
-        }
+        if (msg.type === 'contact-delete') { const contactId = String(msg.contactId || ''); if (cleanEmail(contactId) === ADMIN_EMAIL) return send(ws, { type: 'contact-list', contacts: (await store.getUser(client.user.email))?.contacts || [] }); return send(ws, { type: 'contact-list', contacts: await store.removeContact(client.user.email, contactId) }); }
+        if (msg.type === 'contact-block') { const contactId = String(msg.contactId || ''); if (cleanEmail(contactId) === ADMIN_EMAIL) return send(ws, { type: 'contact-list', contacts: (await store.getUser(client.user.email))?.contacts || [] }); return send(ws, { type: 'contact-list', contacts: await store.blockContact(client.user.email, contactId, !!msg.blocked) }); }
         if (msg.type === 'contacts-get') {
           const user = await store.getUser(client.user.email);
           client.user = user;
@@ -383,23 +375,22 @@ async function main() {
         if (msg.type === 'conference-save') {
           const conf = normalizeConference({ ...(msg.conference || {}), ownerEmail: client.user.email });
           await store.saveConferenceForUsers(conf);
-          for (const c of roomMembers(PRESENCE_ROOM)) {
-            if (c.user && (cleanEmail(c.user.email) === cleanEmail(conf.ownerEmail) || conf.participants.includes(cleanEmail(c.user.email)))) {
-              send(c.ws, { type: 'conference-created', conference: conf, conferenceId: conf.conferenceId, ownerEmail: conf.ownerEmail, participants: conf.participants, sender: client.user.name, email: client.user.email });
-            }
+          const recipients = [cleanEmail(conf.ownerEmail), ...(conf.participants || []).map(cleanEmail)];
+          for (const other of roomMembers(PRESENCE_ROOM)) {
+            if (other.user && recipients.includes(cleanEmail(other.user.email))) send(other.ws, { type: 'conference-created', conference: conf, conferenceId: conf.conferenceId, ownerEmail: conf.ownerEmail, participants: conf.participants, sender: client.user.name, email: client.user.email });
           }
           return send(ws, { type: 'conference-list', conferences: await store.getConferences(client.user.email) });
         }
         if (msg.type === 'conference-delete') {
           const confId = safeString(msg.conferenceId || '');
           const conferences = await store.getConferences(client.user.email);
-          const conf = (conferences || []).find(c => normalizeConference(c).conferenceId === confId);
+          const conf = (conferences || []).find(c => String(c.conferenceId || c.id || '') === confId);
           if (!conf) return send(ws, { type: 'conference-list', conferences: conferences || [] });
-          if (cleanEmail(conf.ownerEmail) !== cleanEmail(client.user.email)) return send(ws, { type: 'error', message: 'Seul le créateur peut supprimer cette conférence.' });
+          if (cleanEmail(conf.ownerEmail) !== cleanEmail(client.user.email)) return send(ws, { type:'error', message:'Seul le créateur peut supprimer cette conférence.' });
           const recipients = [cleanEmail(conf.ownerEmail), ...(conf.participants || []).map(cleanEmail)];
-          for (const email of new Set(recipients)) await store.removeConferenceForUser(email, confId);
-          for (const c of roomMembers(PRESENCE_ROOM)) {
-            if (c.user && recipients.includes(cleanEmail(c.user.email))) send(c.ws, { type: 'conference-deleted', conferenceId: confId, sender: client.user.name, email: client.user.email });
+          for (const email of [...new Set(recipients)]) await store.removeConferenceForUser(email, confId);
+          for (const other of roomMembers(PRESENCE_ROOM)) {
+            if (other.user && recipients.includes(cleanEmail(other.user.email))) send(other.ws, { type:'conference-deleted', conferenceId: confId, sender: client.user.name, email: client.user.email });
           }
           return send(ws, { type: 'conference-list', conferences: await store.getConferences(client.user.email) });
         }
