@@ -15,7 +15,7 @@ const MONGO_URI = process.env.MONGO_URI || '';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'vigi-data.json');
 const MAX_PARTICIPANTS = 12;
 const HISTORY_LIMIT = 100;
-const ADMIN_EMAIL = 'a.cousinier@gmail.com';
+const ADMIN_EMAILS = ['a.cousinier@gmail.com','j.leduc@levigilant.com'];
 const LIVEKIT_URL = process.env.LIVEKIT_URL || '';
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || '';
@@ -362,8 +362,8 @@ async function main() {
           return;
         }
         if (msg.type === 'contact-add') return send(ws, { type: 'contact-list', contacts: await store.upsertContact(client.user.email, msg.contact || {}) });
-        if (msg.type === 'contact-delete') { const contactId = String(msg.contactId || ''); if (cleanEmail(contactId) === ADMIN_EMAIL) return send(ws, { type: 'contact-list', contacts: (await store.getUser(client.user.email))?.contacts || [] }); return send(ws, { type: 'contact-list', contacts: await store.removeContact(client.user.email, contactId) }); }
-        if (msg.type === 'contact-block') { const contactId = String(msg.contactId || ''); if (cleanEmail(contactId) === ADMIN_EMAIL) return send(ws, { type: 'contact-list', contacts: (await store.getUser(client.user.email))?.contacts || [] }); return send(ws, { type: 'contact-list', contacts: await store.blockContact(client.user.email, contactId, !!msg.blocked) }); }
+        if (msg.type === 'contact-delete') { const contactId = String(msg.contactId || ''); if (ADMIN_EMAILS.includes(cleanEmail(contactId))) return send(ws, { type: 'contact-list', contacts: (await store.getUser(client.user.email))?.contacts || [] }); return send(ws, { type: 'contact-list', contacts: await store.removeContact(client.user.email, contactId) }); }
+        if (msg.type === 'contact-block') { const contactId = String(msg.contactId || ''); if (ADMIN_EMAILS.includes(cleanEmail(contactId))) return send(ws, { type: 'contact-list', contacts: (await store.getUser(client.user.email))?.contacts || [] }); return send(ws, { type: 'contact-list', contacts: await store.blockContact(client.user.email, contactId, !!msg.blocked) }); }
         if (msg.type === 'contacts-get') {
           const user = await store.getUser(client.user.email);
           client.user = user;
@@ -375,9 +375,9 @@ async function main() {
         if (msg.type === 'conference-save') {
           const conf = normalizeConference({ ...(msg.conference || {}), ownerEmail: client.user.email });
           await store.saveConferenceForUsers(conf);
-          const recipients = [cleanEmail(conf.ownerEmail), ...(conf.participants || []).map(cleanEmail)];
+          const recipients = [...new Set([cleanEmail(conf.ownerEmail), ...(conf.participants || []).map(cleanEmail)].filter(Boolean))];
           for (const other of roomMembers(PRESENCE_ROOM)) {
-            if (other.user && recipients.includes(cleanEmail(other.user.email))) send(other.ws, { type: 'conference-created', conference: conf, conferenceId: conf.conferenceId, ownerEmail: conf.ownerEmail, participants: conf.participants, sender: client.user.name, email: client.user.email });
+            if (other.user && recipients.includes(cleanEmail(other.user.email))) send(other.ws, { type:'conference-created', conference: conf, conferenceId: conf.conferenceId, ownerEmail: conf.ownerEmail, participants: conf.participants, sender: client.user.name, email: client.user.email });
           }
           return send(ws, { type: 'conference-list', conferences: await store.getConferences(client.user.email) });
         }
@@ -387,8 +387,8 @@ async function main() {
           const conf = (conferences || []).find(c => String(c.conferenceId || c.id || '') === confId);
           if (!conf) return send(ws, { type: 'conference-list', conferences: conferences || [] });
           if (cleanEmail(conf.ownerEmail) !== cleanEmail(client.user.email)) return send(ws, { type:'error', message:'Seul le créateur peut supprimer cette conférence.' });
-          const recipients = [cleanEmail(conf.ownerEmail), ...(conf.participants || []).map(cleanEmail)];
-          for (const email of [...new Set(recipients)]) await store.removeConferenceForUser(email, confId);
+          const recipients = [...new Set([cleanEmail(conf.ownerEmail), ...(conf.participants || []).map(cleanEmail)].filter(Boolean))];
+          for (const email of recipients) await store.removeConferenceForUser(email, confId);
           for (const other of roomMembers(PRESENCE_ROOM)) {
             if (other.user && recipients.includes(cleanEmail(other.user.email))) send(other.ws, { type:'conference-deleted', conferenceId: confId, sender: client.user.name, email: client.user.email });
           }
