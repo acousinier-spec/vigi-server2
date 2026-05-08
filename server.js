@@ -27,6 +27,7 @@ async function getLiveKitAccessTokenClass(){
 }
 
 const rooms = new Map();
+const activeConferenceCalls = new Map();
 let store;
 
 function cleanEmail(v) { return String(v || '').trim().toLowerCase().slice(0, 160); }
@@ -114,7 +115,45 @@ function send(ws, payload) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.
 function publicClient(c) { return { id: c.id, name: c.name, email: c.email || '', role: c.role || 'user' }; }
 function roomMembers(room) { return [...(rooms.get(room) || new Map()).values()].filter(c => c.ws.readyState === WebSocket.OPEN); }
 function broadcast(room, payload, exceptId = null) { for (const client of roomMembers(room)) if (client.id !== exceptId) send(client.ws, payload); }
+function conferenceCallKey(conferenceId, livekitRoom = '') {
+  return safeString(conferenceId || livekitRoom || '').toLowerCase();
+}
+function addConferenceCaller(client, msg = {}) {
+  const key = conferenceCallKey(msg.conferenceId, msg.livekitRoom);
+  if (!key || !client?.user?.email) return 0;
+  if (!activeConferenceCalls.has(key)) activeConferenceCalls.set(key, new Map());
+  activeConferenceCalls.get(key).set(client.id, {
+    id: client.id,
+    email: cleanEmail(client.user.email),
+    name: client.user.name || client.name || '',
+    conferenceId: safeString(msg.conferenceId || ''),
+    livekitRoom: safeString(msg.livekitRoom || ''),
+    joinedAt: Date.now()
+  });
+  return activeConferenceCalls.get(key).size;
+}
+function removeConferenceCaller(client, msg = {}) {
+  const wantedKey = conferenceCallKey(msg.conferenceId, msg.livekitRoom);
+  let remaining = 0;
+  for (const [key, callers] of activeConferenceCalls) {
+    if (wantedKey && key !== wantedKey) continue;
+    callers.delete(client.id);
+    if (client?.user?.email) {
+      const email = cleanEmail(client.user.email);
+      for (const [id, item] of callers) if (cleanEmail(item.email) === email) callers.delete(id);
+    }
+    if (!callers.size) activeConferenceCalls.delete(key);
+    else remaining += callers.size;
+  }
+  return remaining;
+}
+function conferenceActiveCount(conferenceId, livekitRoom = '') {
+  const key = conferenceCallKey(conferenceId, livekitRoom);
+  if (!key) return 0;
+  return activeConferenceCalls.get(key)?.size || 0;
+}
 function leave(client) {
+  removeConferenceCaller(client);
   if (!client.room) return;
   const map = rooms.get(client.room);
   if (map) {
@@ -410,6 +449,12 @@ async function main() {
         }
         if (msg.type === 'conference-save') {
           const conf = normalizeConference({ ...(msg.conference || {}), ownerEmail: client.user.email });
+          const existingConferences = await store.getConferences(client.user.email);
+          const existingConf = (existingConferences || []).find(c => String(c.conferenceId || c.id || '') === String(conf.conferenceId || conf.id || ''));
+          if (existingConf?.active && conf.active === false && conferenceActiveCount(conf.conferenceId, conf.livekitRoom || existingConf.livekitRoom) > 0) {
+            conf.active = true;
+            conf.livekitRoom = existingConf.livekitRoom || conf.livekitRoom;
+          }
           await store.saveConferenceForUsers(conf);
           const recipients = [...new Set([cleanEmail(conf.ownerEmail), ...(conf.participants || []).map(cleanEmail)].filter(Boolean))];
           for (const other of roomMembers(PRESENCE_ROOM)) {
@@ -429,6 +474,35 @@ async function main() {
             if (other.user && recipients.includes(cleanEmail(other.user.email))) send(other.ws, { type:'conference-deleted', conferenceId: confId, sender: client.user.name, email: client.user.email });
           }
           return send(ws, { type: 'conference-list', conferences: await store.getConferences(client.user.email) });
+        }
+        if (msg.type === 'conference-call-join') {
+          const activeCount = addConferenceCaller(client, msg);
+          return send(ws, { type:'conference-call-presence', conferenceId: safeString(msg.conferenceId || ''), livekitRoom: safeString(msg.livekitRoom || ''), activeCount });
+        }
+        if (msg.type === 'conference-call-leave') {
+          const activeCount = removeConferenceCaller(client, msg);
+          return send(ws, { type:'conference-call-presence', conferenceId: safeString(msg.conferenceId || ''), livekitRoom: safeString(msg.livekitRoom || ''), activeCount });
+        }
+        if (msg.type === 'conference-ended') {
+          const confId = safeString(msg.conferenceId || '');
+          const livekitRoom = safeString(msg.livekitRoom || '');
+          const activeCount = conferenceActiveCount(confId, livekitRoom);
+          // Sécurité : un départ participant / fermeture d'application ne doit jamais
+          // fermer la conférence chez les autres. On ignore toute fin non forcée.
+          if (!msg.force || activeCount > 0) {
+            return send(ws, { type:'conference-end-ignored', conferenceId: confId, livekitRoom, activeCount });
+          }
+          const conferences = await store.getConferences(client.user.email);
+          const conf = (conferences || []).find(c => String(c.conferenceId || c.id || '') === confId);
+          if (!conf) return send(ws, { type:'conference-end-ignored', conferenceId: confId, livekitRoom, activeCount });
+          if (cleanEmail(conf.ownerEmail) !== cleanEmail(client.user.email)) return send(ws, { type:'conference-end-ignored', conferenceId: confId, livekitRoom, activeCount });
+          conf.active = false;
+          await store.saveConferenceForUsers(conf);
+          const recipients = [...new Set([cleanEmail(conf.ownerEmail), ...(conf.participants || []).map(cleanEmail)].filter(Boolean))];
+          for (const other of roomMembers(PRESENCE_ROOM)) {
+            if (other.user && recipients.includes(cleanEmail(other.user.email))) send(other.ws, { type:'conference-ended', conferenceId: confId, livekitRoom, force:true, sender: client.user.name, email: client.user.email });
+          }
+          return send(ws, { type:'conference-list', conferences: await store.getConferences(client.user.email) });
         }
         if (msg.type === 'messages-clear-before') {
           const before = Number(msg.before || 0);
