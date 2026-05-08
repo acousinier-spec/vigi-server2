@@ -33,6 +33,18 @@ function cleanEmail(v) { return String(v || '').trim().toLowerCase().slice(0, 16
 function cleanName(v, fallback = 'Utilisateur') { return String(v || fallback).trim().slice(0, 80) || fallback; }
 function cleanId(v) { return String(v || ('contact_' + Date.now() + '_' + crypto.randomBytes(3).toString('hex'))).slice(0, 120); }
 function safeString(value, fallback = '') { return String(value || fallback).slice(0, 200); }
+function escapeRegex(value) { return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function messageBelongsToEmail(message, email) {
+  const e = cleanEmail(email);
+  if (!e) return false;
+  return cleanEmail(message?.fromEmail) === e || cleanEmail(message?.toEmail) === e || String(message?.conversation || '').toLowerCase().includes(e);
+}
+function messageCreatedAtMs(message) {
+  const raw = message?.createdAt || message?.time || message?.date || message?.timestamp || 0;
+  const d = raw instanceof Date ? raw : new Date(raw);
+  const t = d.getTime();
+  return Number.isFinite(t) ? t : 0;
+}
 function publicUser(u) { return { email: u.email, name: u.name, contacts: Array.isArray(u.contacts) ? u.contacts : [], conferences: Array.isArray(u.conferences) ? u.conferences : [] }; }
 function normalizeContact(c) {
   return {
@@ -161,6 +173,15 @@ class FileStore {
   }
   async saveMessage(msg) { this.db.messages.push(msg); if (this.db.messages.length > 5000) this.db.messages = this.db.messages.slice(-5000); this.save(); return msg; }
   async history(key) { return this.db.messages.filter(m => m.conversation === key).slice(-HISTORY_LIMIT); }
+  async deleteMessagesForUserBefore(email, beforeMs) {
+    const limit = Number(beforeMs || 0);
+    if (!cleanEmail(email) || !Number.isFinite(limit) || limit <= 0) return 0;
+    const before = this.db.messages.length;
+    this.db.messages = this.db.messages.filter(m => !(messageBelongsToEmail(m, email) && messageCreatedAtMs(m) <= limit));
+    const removed = before - this.db.messages.length;
+    if (removed > 0) this.save();
+    return removed;
+  }
   async saveConferenceForUsers(conf) {
     const c = normalizeConference(conf);
     const targets = [...new Set([c.ownerEmail, ...c.participants].filter(Boolean))];
@@ -220,6 +241,21 @@ class MongoStore {
   }
   async saveMessage(msg) { await this.messages.insertOne(msg); return msg; }
   async history(key) { return await this.messages.find({ conversation: key }).sort({ createdAt: -1 }).limit(HISTORY_LIMIT).toArray().then(a => a.reverse()); }
+  async deleteMessagesForUserBefore(email, beforeMs) {
+    const e = cleanEmail(email);
+    const limit = Number(beforeMs || 0);
+    if (!e || !Number.isFinite(limit) || limit <= 0) return 0;
+    const beforeDate = new Date(limit);
+    const res = await this.messages.deleteMany({
+      createdAt: { $lte: beforeDate },
+      $or: [
+        { fromEmail: e },
+        { toEmail: e },
+        { conversation: { $regex: escapeRegex(e), $options: 'i' } }
+      ]
+    });
+    return res.deletedCount || 0;
+  }
   async saveConferenceForUsers(conf) {
     const c = normalizeConference(conf);
     const targets = [...new Set([c.ownerEmail, ...c.participants].filter(Boolean))];
@@ -393,6 +429,11 @@ async function main() {
             if (other.user && recipients.includes(cleanEmail(other.user.email))) send(other.ws, { type:'conference-deleted', conferenceId: confId, sender: client.user.name, email: client.user.email });
           }
           return send(ws, { type: 'conference-list', conferences: await store.getConferences(client.user.email) });
+        }
+        if (msg.type === 'messages-clear-before') {
+          const before = Number(msg.before || 0);
+          const removed = await store.deleteMessagesForUserBefore(client.user.email, before);
+          return send(ws, { type: 'messages-cleared', before, removed });
         }
         if (msg.type === 'history-get') {
           const key = safeString(msg.conversation || conversationKey(safeString(msg.room, client.room || 'levigilant'), client.email, cleanEmail(msg.targetEmail)));
