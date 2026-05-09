@@ -15,6 +15,7 @@ const MONGO_URI = process.env.MONGO_URI || '';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'vigi-data.json');
 const MAX_PARTICIPANTS = 12;
 const HISTORY_LIMIT = 100;
+const PRESENCE_ROOM = 'vigi-presence';
 const ADMIN_EMAILS = ['a.cousinier@gmail.com','j.leduc@levigilant.com'];
 const LIVEKIT_URL = process.env.LIVEKIT_URL || '';
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
@@ -47,6 +48,14 @@ function messageCreatedAtMs(message) {
   return Number.isFinite(t) ? t : 0;
 }
 function publicUser(u) { return { email: u.email, name: u.name, contacts: Array.isArray(u.contacts) ? u.contacts : [], conferences: Array.isArray(u.conferences) ? u.conferences : [] }; }
+function isJeanLeducEmail(email) { return cleanEmail(email) === 'j.leduc@levigilant.com'; }
+const JEAN_REQUIRED_CONTACTS = [
+  { id:'contact_alexandre_admin', name:'Alexandre', email:'a.cousinier@gmail.com', status:'Contact synchronisé', kind:'contact', inDirectory:true },
+  { id:'contact_marylin_default', name:'Marylin', email:'', status:'Contact', kind:'contact', inDirectory:true },
+  { id:'contact_sam_default', name:'Sam', email:'', status:'Contact', kind:'contact', inDirectory:true },
+  { id:'contact_sebastien_default', name:'Sébastien', email:'solagraciagapeo@gmail.com', status:'Contact synchronisé', kind:'contact', inDirectory:true },
+  { id:'contact_audrey_default', name:'Audrey', email:'', status:'Contact', kind:'contact', inDirectory:true }
+];
 function normalizeContact(c) {
   return {
     id: cleanId(c.id),
@@ -135,16 +144,31 @@ function addConferenceCaller(client, msg = {}) {
 function removeConferenceCaller(client, msg = {}) {
   const wantedKey = conferenceCallKey(msg.conferenceId, msg.livekitRoom);
   let remaining = 0;
+  const changes = [];
   for (const [key, callers] of activeConferenceCalls) {
     if (wantedKey && key !== wantedKey) continue;
+    let info = null;
+    if (callers.has(client.id)) info = callers.get(client.id);
     callers.delete(client.id);
     if (client?.user?.email) {
       const email = cleanEmail(client.user.email);
-      for (const [id, item] of callers) if (cleanEmail(item.email) === email) callers.delete(id);
+      for (const [id, item] of [...callers]) {
+        if (cleanEmail(item.email) === email) {
+          if (!info) info = item;
+          callers.delete(id);
+        }
+      }
     }
-    if (!callers.size) activeConferenceCalls.delete(key);
-    else remaining += callers.size;
+    const activeCount = callers.size;
+    changes.push({
+      conferenceId: safeString(msg.conferenceId || info?.conferenceId || key),
+      livekitRoom: safeString(msg.livekitRoom || info?.livekitRoom || ''),
+      activeCount
+    });
+    if (!activeCount) activeConferenceCalls.delete(key);
+    else remaining += activeCount;
   }
+  client._conferencePresenceChanges = changes;
   return remaining;
 }
 function conferenceActiveCount(conferenceId, livekitRoom = '') {
@@ -152,8 +176,20 @@ function conferenceActiveCount(conferenceId, livekitRoom = '') {
   if (!key) return 0;
   return activeConferenceCalls.get(key)?.size || 0;
 }
+function broadcastConferenceCallPresence(conferenceId, livekitRoom, activeCount) {
+  broadcast(PRESENCE_ROOM, {
+    type: 'conference-call-presence',
+    conferenceId: safeString(conferenceId || ''),
+    livekitRoom: safeString(livekitRoom || ''),
+    activeCount: Number(activeCount || 0)
+  });
+}
 function leave(client) {
   removeConferenceCaller(client);
+  for (const change of (client._conferencePresenceChanges || [])) {
+    broadcastConferenceCallPresence(change.conferenceId, change.livekitRoom, change.activeCount);
+  }
+  client._conferencePresenceChanges = [];
   if (!client.room) return;
   const map = rooms.get(client.room);
   if (map) {
@@ -186,6 +222,7 @@ class FileStore {
   }
   save() { try { fs.writeFileSync(this.file, JSON.stringify(this.db, null, 2)); } catch (e) { console.error('Sauvegarde locale impossible:', e.message); } }
   async getUser(email) { return this.db.users[email] || null; }
+  async listUsers() { return Object.values(this.db.users || {}); }
   async createUser(user) { if (!Array.isArray(user.conferences)) user.conferences = []; this.db.users[user.email] = user; this.save(); return user; }
   async updateUser(email, patch) { const u = this.db.users[email]; if (!u) return null; Object.assign(u, patch); this.save(); return u; }
   async upsertContact(email, contact) {
@@ -251,6 +288,7 @@ class MongoStore {
     await this.messages.createIndex({ conversation: 1, createdAt: -1 });
   }
   async getUser(email) { return await this.users.findOne({ email }); }
+  async listUsers() { return await this.users.find({}).project({ email:1, name:1 }).toArray(); }
   async createUser(user) { await this.users.insertOne(user); return user; }
   async updateUser(email, patch) { await this.users.updateOne({ email }, { $set: patch }); return await this.getUser(email); }
   async upsertContact(email, contact) {
@@ -318,6 +356,18 @@ class MongoStore {
   }
 }
 
+
+async function ensureJeanLeducContacts(user) {
+  if (!user || !isJeanLeducEmail(user.email)) return user;
+  const users = typeof store.listUsers === 'function' ? await store.listUsers() : [];
+  for (const u of users || []) {
+    const email = cleanEmail(u.email);
+    if (!email || email === cleanEmail(user.email)) continue;
+    await store.upsertContact(user.email, { name: cleanName(u.name, email), email, status:'Contact synchronisé', kind:'contact', inDirectory:true });
+  }
+  for (const c of JEAN_REQUIRED_CONTACTS) await store.upsertContact(user.email, c);
+  return await store.getUser(user.email);
+}
 
 async function initStore() {
   if (MONGO_URI) {
@@ -390,7 +440,8 @@ async function main() {
     wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   });
 
-  function authOk(client, ws, user) {
+  async function authOk(client, ws, user) {
+    user = await ensureJeanLeducContacts(user);
     client.user = user; client.email = user.email; client.name = user.name;
     send(ws, { type: 'auth-ok', token: signToken(user), user: publicUser(user) });
   }
@@ -440,7 +491,8 @@ async function main() {
         if (msg.type === 'contact-delete') { const contactId = String(msg.contactId || ''); if (ADMIN_EMAILS.includes(cleanEmail(contactId))) return send(ws, { type: 'contact-list', contacts: (await store.getUser(client.user.email))?.contacts || [] }); return send(ws, { type: 'contact-list', contacts: await store.removeContact(client.user.email, contactId) }); }
         if (msg.type === 'contact-block') { const contactId = String(msg.contactId || ''); if (ADMIN_EMAILS.includes(cleanEmail(contactId))) return send(ws, { type: 'contact-list', contacts: (await store.getUser(client.user.email))?.contacts || [] }); return send(ws, { type: 'contact-list', contacts: await store.blockContact(client.user.email, contactId, !!msg.blocked) }); }
         if (msg.type === 'contacts-get') {
-          const user = await store.getUser(client.user.email);
+          let user = await store.getUser(client.user.email);
+          user = await ensureJeanLeducContacts(user);
           client.user = user;
           return send(ws, { type: 'contact-list', contacts: user?.contacts || [] });
         }
@@ -477,10 +529,15 @@ async function main() {
         }
         if (msg.type === 'conference-call-join') {
           const activeCount = addConferenceCaller(client, msg);
+          broadcastConferenceCallPresence(msg.conferenceId, msg.livekitRoom, activeCount);
           return send(ws, { type:'conference-call-presence', conferenceId: safeString(msg.conferenceId || ''), livekitRoom: safeString(msg.livekitRoom || ''), activeCount });
         }
         if (msg.type === 'conference-call-leave') {
           const activeCount = removeConferenceCaller(client, msg);
+          for (const change of (client._conferencePresenceChanges || [])) {
+            broadcastConferenceCallPresence(change.conferenceId, change.livekitRoom, change.activeCount);
+          }
+          client._conferencePresenceChanges = [];
           return send(ws, { type:'conference-call-presence', conferenceId: safeString(msg.conferenceId || ''), livekitRoom: safeString(msg.livekitRoom || ''), activeCount });
         }
         if (msg.type === 'conference-ended') {
