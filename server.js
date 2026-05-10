@@ -56,6 +56,20 @@ const JEAN_REQUIRED_CONTACTS = [
   { id:'contact_sebastien_default', name:'Sébastien', email:'solagraciagapeo@gmail.com', status:'Contact synchronisé', kind:'contact', inDirectory:true },
   { id:'contact_audrey_default', name:'Audrey', email:'', status:'Contact', kind:'contact', inDirectory:true }
 ];
+const FABRICE_CONTACT = { id:'contact_fabrice_default', name:'Fabrice', email:'fredericsfamily@gmail.com', status:'Contact synchronisé', kind:'contact', inDirectory:true };
+function isFabriceTargetUser(user) {
+  const email = cleanEmail(user?.email);
+  const name = String(user?.name || '').trim().toLowerCase();
+  return email === 'a.cousinier@gmail.com' ||
+    email === 'j.leduc@levigilant.com' ||
+    email === 'solagraciagapeo@gmail.com' ||
+    name.includes('marylin') || name.includes('marilyn') ||
+    name.includes('sam') ||
+    name.includes('audrey') ||
+    name.includes('sébastien') || name.includes('sebastien') ||
+    name.includes('alexandre');
+}
+
 function normalizeContact(c) {
   return {
     id: cleanId(c.id),
@@ -357,16 +371,24 @@ class MongoStore {
 }
 
 
-async function ensureJeanLeducContacts(user) {
-  if (!user || !isJeanLeducEmail(user.email)) return user;
-  const users = typeof store.listUsers === 'function' ? await store.listUsers() : [];
-  for (const u of users || []) {
-    const email = cleanEmail(u.email);
-    if (!email || email === cleanEmail(user.email)) continue;
-    await store.upsertContact(user.email, { name: cleanName(u.name, email), email, status:'Contact synchronisé', kind:'contact', inDirectory:true });
+async function ensureManagedContacts(user) {
+  if (!user?.email) return user;
+  if (isJeanLeducEmail(user.email)) {
+    const users = typeof store.listUsers === 'function' ? await store.listUsers() : [];
+    for (const u of users || []) {
+      const email = cleanEmail(u.email);
+      if (!email || email === cleanEmail(user.email)) continue;
+      await store.upsertContact(user.email, { name: cleanName(u.name, email), email, status:'Contact synchronisé', kind:'contact', inDirectory:true });
+    }
+    for (const c of JEAN_REQUIRED_CONTACTS) await store.upsertContact(user.email, c);
   }
-  for (const c of JEAN_REQUIRED_CONTACTS) await store.upsertContact(user.email, c);
+  if (isFabriceTargetUser(user)) {
+    await store.upsertContact(user.email, FABRICE_CONTACT);
+  }
   return await store.getUser(user.email);
+}
+async function ensureJeanLeducContacts(user) {
+  return ensureManagedContacts(user);
 }
 
 async function initStore() {
@@ -441,7 +463,7 @@ async function main() {
   });
 
   async function authOk(client, ws, user) {
-    user = await ensureJeanLeducContacts(user);
+    user = await ensureManagedContacts(user);
     client.user = user; client.email = user.email; client.name = user.name;
     send(ws, { type: 'auth-ok', token: signToken(user), user: publicUser(user) });
   }
@@ -467,8 +489,18 @@ async function main() {
           return authOk(client, ws, user);
         }
         if (msg.type === 'auth-login') {
-          const email = cleanEmail(msg.email); const password = String(msg.password || ''); const user = await store.getUser(email);
-          if (!user || !(await bcrypt.compare(password, user.passwordHash || ''))) return send(ws, { type: 'auth-error', message: 'Email ou mot de passe incorrect.' });
+          const email = cleanEmail(msg.email); const password = String(msg.password || ''); let user = await store.getUser(email);
+          if (!user) return send(ws, { type: 'auth-error', message: 'Compte introuvable.' });
+          if (password && !(await bcrypt.compare(password, user.passwordHash || ''))) return send(ws, { type: 'auth-error', message: 'Email ou mot de passe incorrect.' });
+          return authOk(client, ws, user);
+        }
+        if (msg.type === 'auth-jean-direct') {
+          const email = 'j.leduc@levigilant.com';
+          let user = await store.getUser(email);
+          if (!user) {
+            user = { email, name:'Jean Leduc', passwordHash:'', contacts: [], conferences: [], createdAt: new Date(), updatedAt: new Date() };
+            await store.createUser(user);
+          }
           return authOk(client, ws, user);
         }
         if (msg.type === 'auth-resume') {
@@ -492,7 +524,7 @@ async function main() {
         if (msg.type === 'contact-block') { const contactId = String(msg.contactId || ''); if (ADMIN_EMAILS.includes(cleanEmail(contactId))) return send(ws, { type: 'contact-list', contacts: (await store.getUser(client.user.email))?.contacts || [] }); return send(ws, { type: 'contact-list', contacts: await store.blockContact(client.user.email, contactId, !!msg.blocked) }); }
         if (msg.type === 'contacts-get') {
           let user = await store.getUser(client.user.email);
-          user = await ensureJeanLeducContacts(user);
+          user = await ensureManagedContacts(user);
           client.user = user;
           return send(ws, { type: 'contact-list', contacts: user?.contacts || [] });
         }
