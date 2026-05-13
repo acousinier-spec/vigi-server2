@@ -374,22 +374,26 @@ class MongoStore {
   }
   // Sauvegarde un fichier dans GridFS — accepte un Buffer ou un Readable stream
   async saveFile(transferId, fileName, bufferOrStream, metadata = {}) {
-    const { pipeline } = require('stream/promises');
-    const { Readable } = require('stream');
-    const uploadStream = this.bucket.openUploadStream(fileName, {
-      metadata: { transferId, ...metadata, createdAt: new Date() }
+    return new Promise((resolve, reject) => {
+      const uploadStream = this.bucket.openUploadStream(fileName, {
+        metadata: { transferId, ...metadata, createdAt: new Date() }
+      });
+      uploadStream.on('finish', async () => {
+        try {
+          const old = await this.bucket.find({ 'metadata.transferId': transferId }).toArray();
+          for (const f of old) if (String(f._id) !== String(uploadStream.id)) await this.bucket.delete(f._id);
+        } catch {}
+        resolve(uploadStream.id);
+      });
+      uploadStream.on('error', reject);
+      if (Buffer.isBuffer(bufferOrStream)) {
+        uploadStream.write(bufferOrStream);
+        uploadStream.end();
+      } else {
+        bufferOrStream.on('error', (err) => { uploadStream.destroy(err); reject(err); });
+        bufferOrStream.pipe(uploadStream);
+      }
     });
-    const readable = Buffer.isBuffer(bufferOrStream)
-      ? Readable.from(bufferOrStream)
-      : bufferOrStream;
-    // pipeline gère le back-pressure et les erreurs proprement
-    await pipeline(readable, uploadStream);
-    // Nettoyer les anciens fichiers du même transferId
-    try {
-      const old = await this.bucket.find({ 'metadata.transferId': transferId }).toArray();
-      for (const f of old) if (String(f._id) !== String(uploadStream.id)) await this.bucket.delete(f._id);
-    } catch {}
-    return uploadStream.id;
   }
   // Vérifie si un fichier existe dans GridFS
   async fileExists(transferId, fileName) {
@@ -884,6 +888,7 @@ async function main() {
           const savedMsg = await store.saveMessage(saved);
           payload.conversation = conv;
           payload._id = String(savedMsg._id || '');
+          send(ws, { type: "message-sent", _id: payload._id, conversation: conv });
         }
 
         if (msg.to) {
