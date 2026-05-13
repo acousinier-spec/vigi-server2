@@ -309,14 +309,78 @@ class FileStore {
     u.conferences = (u.conferences || []).filter(c => String(c.conferenceId || c.id || '') !== String(conferenceId || ''));
     this.save(); return u.conferences;
   }
+  // Fichiers sur disque (fallback local — non persistant sur Render)
+  async saveFile(transferId, fileName, buffer) {
+    const dir = path.join(__dirname, 'vigi-uploads', transferId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, fileName), buffer);
+  }
+  async fileExists(transferId, fileName) {
+    return fs.existsSync(path.join(__dirname, 'vigi-uploads', transferId, fileName));
+  }
+  streamFile(transferId, fileName, res) {
+    return new Promise((resolve, reject) => {
+      const p = path.join(__dirname, 'vigi-uploads', transferId, fileName);
+      if (!fs.existsSync(p)) return reject(new Error('not found'));
+      const stat = fs.statSync(p);
+      res.setHeader('Content-Length', stat.size);
+      fs.createReadStream(p).pipe(res).on('finish', resolve).on('error', reject);
+    });
+  }
 }
 
 
 class MongoStore {
-  constructor(client) { this.client = client; this.db = client.db(process.env.MONGO_DB || 'vigi_messenger'); this.users = this.db.collection('users'); this.messages = this.db.collection('messages'); }
+  constructor(client) {
+    this.client = client;
+    this.db = client.db(process.env.MONGO_DB || 'vigi_messenger');
+    this.users = this.db.collection('users');
+    this.messages = this.db.collection('messages');
+  }
   async init() {
     await this.users.createIndex({ email: 1 }, { unique: true });
     await this.messages.createIndex({ conversation: 1, createdAt: -1 });
+    // GridFS bucket pour les fichiers — persistant dans MongoDB Atlas
+    const { GridFSBucket } = require('mongodb');
+    this.bucket = new GridFSBucket(this.db, { bucketName: 'vigi_files' });
+  }
+  // Sauvegarde un fichier dans GridFS (survit aux redémarrages Render)
+  async saveFile(transferId, fileName, buffer, metadata = {}) {
+    const uploadStream = this.bucket.openUploadStream(fileName, {
+      metadata: { transferId, ...metadata, createdAt: new Date() }
+    });
+    await new Promise((resolve, reject) => {
+      uploadStream.on('finish', resolve);
+      uploadStream.on('error', reject);
+      uploadStream.write(buffer);
+      uploadStream.end();
+    });
+    // Nettoyer les anciens fichiers du même transferId
+    try {
+      const old = await this.bucket.find({ 'metadata.transferId': transferId }).toArray();
+      for (const f of old) if (String(f._id) !== String(uploadStream.id)) await this.bucket.delete(f._id);
+    } catch {}
+    return uploadStream.id;
+  }
+  // Vérifie si un fichier existe dans GridFS
+  async fileExists(transferId, fileName) {
+    const files = await this.bucket.find({ 'metadata.transferId': transferId, filename: fileName }).limit(1).toArray();
+    return files.length > 0;
+  }
+  // Stream un fichier depuis GridFS vers la réponse HTTP
+  streamFile(transferId, fileName, res) {
+    return new Promise((resolve, reject) => {
+      const stream = this.bucket.openDownloadStreamByName(fileName, {});
+      // Chercher par transferId si le nom seul ne suffit pas
+      stream.on('error', async () => {
+        try {
+          const files = await this.bucket.find({ 'metadata.transferId': transferId }).limit(1).toArray();
+          if (!files.length) return reject(new Error('not found'));
+          this.bucket.openDownloadStream(files[0]._id).pipe(res).on('finish', resolve).on('error', reject);
+        } catch (e) { reject(e); }
+      });
+      stream.pipe(res).on('finish', resolve).on('error', reject);
+    });
   }
   async getUser(email) { return await this.users.findOne({ email }); }
   async listUsers() { return await this.users.find({}).project({ email:1, name:1 }).toArray(); }
@@ -470,12 +534,13 @@ async function main() {
         transfer.chunks.set(Number(chunkIndex), Buffer.from(data, 'base64'));
         // Tous les chunks reçus → assembler le fichier
         if (transfer.chunks.size === transfer.totalChunks) {
-          const fileDir = path.join(UPLOAD_DIR, transferId);
-          fs.mkdirSync(fileDir, { recursive: true });
-          const filePath = path.join(fileDir, transfer.fileName);
           const buffers = [];
           for (let i = 0; i < transfer.totalChunks; i++) buffers.push(transfer.chunks.get(i));
-          fs.writeFileSync(filePath, Buffer.concat(buffers));
+          const fileBuffer = Buffer.concat(buffers);
+          // Sauvegarder dans MongoDB GridFS (persistant) ou sur disque (fallback local)
+          await store.saveFile(transferId, transfer.fileName, fileBuffer, {
+            fromEmail: transfer.fromEmail, toEmail: transfer.toEmail
+          });
           const downloadUrl = `/download/${transferId}/${encodeURIComponent(transfer.fileName)}`;
           // Sauvegarder le message dans la DB (sinon il disparaît au history-get)
           const conv = conversationKey(PRESENCE_ROOM, transfer.fromEmail, transfer.toEmail);
@@ -512,16 +577,19 @@ async function main() {
     if (req.method === 'GET' && pathname.startsWith('/download/')) {
       const parts = pathname.slice('/download/'.length).split('/');
       if (parts.length < 2) return sendHttp(res, 404, 'Not found');
-      const safeTid = parts[0].replace(/[^a-zA-Z0-9]/g, '');
+      const safeTid  = parts[0].replace(/[^a-zA-Z0-9\-]/g, '');
       const safeName = decodeURIComponent(parts[1]).replace(/[/\\]/g, '');
-      const filePath = path.join(UPLOAD_DIR, safeTid, safeName);
-      if (!filePath.startsWith(UPLOAD_DIR) || !fs.existsSync(filePath))
-        return sendHttp(res, 404, 'Fichier introuvable ou expiré (24h max)');
-      const stat = fs.statSync(filePath);
-      res.writeHead(200, { 'Content-Type': 'application/octet-stream',
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
         'Content-Disposition': `attachment; filename="${safeName}"`,
-        'Content-Length': stat.size, 'Access-Control-Allow-Origin': '*' });
-      fs.createReadStream(filePath).pipe(res);
+        'Access-Control-Allow-Origin': '*'
+      });
+      try {
+        await store.streamFile(safeTid, safeName, res);
+      } catch {
+        if (!res.headersSent) sendHttp(res, 404, 'Fichier introuvable ou expiré (24h max)');
+        else res.end();
+      }
       return;
     }
 
