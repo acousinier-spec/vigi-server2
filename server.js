@@ -361,7 +361,7 @@ class MongoStore {
     // Nettoyage automatique GridFS toutes les heures — supprime les fichiers > 24h
     const cleanGridFS = async () => {
       try {
-        const cutoff = new Date(Date.now() - 1 * 60 * 60 * 1000); // 1 heure
+        const cutoff = new Date(Date.now() - 30 * 60 * 1000); // 30 minutes (au lieu de 1h)
         const old = await this.bucket.find({ uploadDate: { $lt: cutoff } }).toArray();
         for (const f of old) {
           try { await this.bucket.delete(f._id); } catch {}
@@ -521,6 +521,14 @@ async function initStore() {
     const mongo = new MongoStore(client);
     await mongo.init();
     console.log('MongoDB connected: persistent users, contacts, messages enabled');
+    // Nettoyage agressif au démarrage si quota dépassé
+    try {
+      const old = await mongo.bucket.find({ uploadDate: { $lt: new Date(Date.now() - 30 * 60 * 1000) } }).toArray();
+      for (const f of old) {
+        try { await mongo.bucket.delete(f._id); } catch {}
+      }
+      if (old.length) console.log(`Nettoyage startup GridFS : ${old.length} fichier(s) supprimé(s)`);
+    } catch (e) { console.warn('Cleanup startup échoué:', e.message); }
     return mongo;
   }
   console.warn('MONGO_URI absent: fallback fichier local. Sur Render, ce stockage peut être perdu au redémarrage.');
