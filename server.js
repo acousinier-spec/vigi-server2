@@ -124,6 +124,23 @@ function readJson(req) {
     req.on('error', reject);
   });
 }
+// Lecture de gros corps (pour les chunks de fichiers — jusqu'à 2 MB)
+function readLargeBody(req, maxBytes = 2 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', chunk => {
+      total += chunk.length;
+      if (total > maxBytes) return reject(new Error('Chunk trop volumineux'));
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+      catch { reject(new Error('JSON invalide')); }
+    });
+    req.on('error', reject);
+  });
+}
 function sendJson(res, code, obj) { return sendHttp(res, code, JSON.stringify(obj), 'application/json; charset=utf-8'); }
 async function userFromAuth(req) {
   const header = req.headers.authorization || '';
@@ -406,12 +423,88 @@ async function initStore() {
 
 async function main() {
   store = await initStore();
+
+  // --- Stockage temporaire pour les transferts de fichiers par chunks ---
+  const UPLOAD_DIR = path.join(__dirname, 'vigi-uploads');
+  if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  const chunkStore = new Map(); // transferId → { chunks, totalChunks, fileName, fileSize, ... }
+  // Nettoyage automatique toutes les heures (fichiers > 24h supprimés)
+  setInterval(() => {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [tid, info] of chunkStore) { if (info.createdAt < cutoff) chunkStore.delete(tid); }
+    try {
+      for (const f of fs.readdirSync(UPLOAD_DIR)) {
+        const fp = path.join(UPLOAD_DIR, f);
+        if (fs.statSync(fp).mtimeMs < cutoff) fs.rmSync(fp, { recursive: true, force: true });
+      }
+    } catch {}
+  }, 60 * 60 * 1000);
   const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') return sendHttp(res, 204, '');
     const pathname = (req.url || '/').split('?')[0];
 
     if (req.method === 'GET' && (pathname === '/health' || pathname === '/' || pathname === '/ws')) {
       return sendHttp(res, 200, `Vigi Messenger signaling server OK\nWebSocket: ready on /ws\nAccounts: enabled\nContacts: synchronized\nStorage: ${MONGO_URI ? 'MongoDB persistent' : 'local fallback'}\nLiveKit: ${liveKitConfigured() ? 'configured' : 'not configured'}\n`);
+    }
+
+    // ── POST /upload-chunk ── Réception d'un morceau de fichier ──────────
+    if (req.method === 'POST' && pathname === '/upload-chunk') {
+      try {
+        const user = await userFromAuth(req);
+        if (!user) return sendJson(res, 401, { ok: false, message: 'Non authentifié' });
+        const body = await readLargeBody(req, 2 * 1024 * 1024);
+        const { transferId, chunkIndex, totalChunks, fileName, fileSize, toClientId, room, sender, data } = body;
+        if (!transferId || chunkIndex == null || !totalChunks || !data)
+          return sendJson(res, 400, { ok: false, message: 'Paramètres manquants' });
+        if (!chunkStore.has(transferId)) {
+          chunkStore.set(transferId, {
+            chunks: new Map(), totalChunks: Number(totalChunks),
+            fileName: String(fileName || 'fichier').replace(/[^\w.\- ]/g, '_').slice(0, 200),
+            fileSize: Number(fileSize || 0), fromEmail: user.email,
+            toClientId: String(toClientId || ''), room: String(room || ''),
+            sender: String(sender || user.name || ''), createdAt: Date.now()
+          });
+        }
+        const transfer = chunkStore.get(transferId);
+        transfer.chunks.set(Number(chunkIndex), Buffer.from(data, 'base64'));
+        // Tous les chunks reçus → assembler le fichier
+        if (transfer.chunks.size === transfer.totalChunks) {
+          const fileDir = path.join(UPLOAD_DIR, transferId);
+          fs.mkdirSync(fileDir, { recursive: true });
+          const filePath = path.join(fileDir, transfer.fileName);
+          const buffers = [];
+          for (let i = 0; i < transfer.totalChunks; i++) buffers.push(transfer.chunks.get(i));
+          fs.writeFileSync(filePath, Buffer.concat(buffers));
+          const downloadUrl = `/download/${transferId}/${encodeURIComponent(transfer.fileName)}`;
+          // Notifier le destinataire via WebSocket
+          const target = rooms.get(transfer.room)?.get(transfer.toClientId);
+          if (target) send(target.ws, { type: 'file', sender: transfer.sender, email: transfer.fromEmail,
+            text: 'Document envoyé', file: { name: transfer.fileName, size: transfer.fileSize, url: downloadUrl, transferId } });
+          chunkStore.delete(transferId);
+          return sendJson(res, 200, { ok: true, complete: true, url: downloadUrl });
+        }
+        return sendJson(res, 200, { ok: true, complete: false, received: transfer.chunks.size });
+      } catch (e) {
+        console.error('upload-chunk error:', e);
+        return sendJson(res, 500, { ok: false, message: e.message });
+      }
+    }
+
+    // ── GET /download/:transferId/:filename ── Téléchargement ────────────
+    if (req.method === 'GET' && pathname.startsWith('/download/')) {
+      const parts = pathname.slice('/download/'.length).split('/');
+      if (parts.length < 2) return sendHttp(res, 404, 'Not found');
+      const safeTid = parts[0].replace(/[^a-zA-Z0-9]/g, '');
+      const safeName = decodeURIComponent(parts[1]).replace(/[/\\]/g, '');
+      const filePath = path.join(UPLOAD_DIR, safeTid, safeName);
+      if (!filePath.startsWith(UPLOAD_DIR) || !fs.existsSync(filePath))
+        return sendHttp(res, 404, 'Fichier introuvable ou expiré (24h max)');
+      const stat = fs.statSync(filePath);
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${safeName}"`,
+        'Content-Length': stat.size, 'Access-Control-Allow-Origin': '*' });
+      fs.createReadStream(filePath).pipe(res);
+      return;
     }
 
     if (req.method === 'POST' && pathname === '/api/livekit/token') {
