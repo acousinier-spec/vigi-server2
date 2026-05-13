@@ -477,6 +477,15 @@ async function main() {
           for (let i = 0; i < transfer.totalChunks; i++) buffers.push(transfer.chunks.get(i));
           fs.writeFileSync(filePath, Buffer.concat(buffers));
           const downloadUrl = `/download/${transferId}/${encodeURIComponent(transfer.fileName)}`;
+          // Sauvegarder le message dans la DB (sinon il disparaît au history-get)
+          const conv = conversationKey(PRESENCE_ROOM, transfer.fromEmail, transfer.toEmail);
+          await store.saveMessage({
+            type: 'file', conversation: conv, room: PRESENCE_ROOM,
+            fromEmail: transfer.fromEmail, fromName: transfer.sender,
+            toEmail: transfer.toEmail, text: 'Document envoyé',
+            file: { name: transfer.fileName, size: transfer.fileSize, url: downloadUrl, transferId },
+            createdAt: new Date(), time: new Date().toISOString()
+          });
           // Chercher le destinataire par email dans toutes les rooms (plus fiable que clientId)
           let target = rooms.get(transfer.room)?.get(transfer.toClientId);
           if (!target && transfer.toEmail) {
