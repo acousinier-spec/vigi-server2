@@ -367,6 +367,25 @@ class MongoStore {
     const files = await this.bucket.find({ 'metadata.transferId': transferId, filename: fileName }).limit(1).toArray();
     return files.length > 0;
   }
+  // Sauvegarde un fichier depuis un Readable stream vers GridFS (sans charger en RAM)
+  saveFileStream(transferId, fileName, readable, metadata = {}) {
+    return new Promise((resolve, reject) => {
+      const uploadStream = this.bucket.openUploadStream(fileName, {
+        metadata: { transferId, ...metadata, createdAt: new Date() }
+      });
+      readable.pipe(uploadStream);
+      uploadStream.on('finish', async () => {
+        // Nettoyer les anciens fichiers du même transferId
+        try {
+          const old = await this.bucket.find({ 'metadata.transferId': transferId }).toArray();
+          for (const f of old) if (String(f._id) !== String(uploadStream.id)) await this.bucket.delete(f._id);
+        } catch {}
+        resolve(uploadStream.id);
+      });
+      uploadStream.on('error', reject);
+      readable.on('error', reject);
+    });
+  }
   // Stream un fichier depuis GridFS vers la réponse HTTP
   streamFile(transferId, fileName, res) {
     return new Promise((resolve, reject) => {
@@ -489,13 +508,19 @@ async function main() {
   store = await initStore();
 
   // --- Stockage temporaire pour les transferts de fichiers par chunks ---
+  // Les chunks sont ecrits sur disque (pas en RAM) pour eviter les crashes memoire sur Render
   const UPLOAD_DIR = path.join(__dirname, 'vigi-uploads');
   if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  const chunkStore = new Map(); // transferId → { chunks, totalChunks, fileName, fileSize, ... }
-  // Nettoyage automatique toutes les heures (fichiers > 24h supprimés)
+  const chunkStore = new Map(); // transferId -> { receivedChunks: Set, totalChunks, fileName, ... }
+  // Nettoyage automatique toutes les heures (fichiers > 24h supprimes)
   setInterval(() => {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-    for (const [tid, info] of chunkStore) { if (info.createdAt < cutoff) chunkStore.delete(tid); }
+    for (const [tid, info] of chunkStore) {
+      if (info.createdAt < cutoff) {
+        chunkStore.delete(tid);
+        try { fs.rmSync(path.join(UPLOAD_DIR, tid), { recursive: true, force: true }); } catch {}
+      }
+    }
     try {
       for (const f of fs.readdirSync(UPLOAD_DIR)) {
         const fp = path.join(UPLOAD_DIR, f);
@@ -520,9 +545,15 @@ async function main() {
         const { transferId, chunkIndex, totalChunks, fileName, fileSize, toClientId, room, sender, data } = body;
         if (!transferId || chunkIndex == null || !totalChunks || !data)
           return sendJson(res, 400, { ok: false, message: 'Paramètres manquants' });
-        if (!chunkStore.has(transferId)) {
-          chunkStore.set(transferId, {
-            chunks: new Map(), totalChunks: Number(totalChunks),
+
+        // Sécuriser le transferId pour l'utiliser comme nom de dossier
+        const safeTid = String(transferId).replace(/[^a-zA-Z0-9\-_]/g, '').slice(0, 64);
+        const chunkDir = path.join(UPLOAD_DIR, safeTid);
+
+        if (!chunkStore.has(safeTid)) {
+          fs.mkdirSync(chunkDir, { recursive: true });
+          chunkStore.set(safeTid, {
+            receivedChunks: new Set(), totalChunks: Number(totalChunks),
             fileName: String(fileName || 'fichier').replace(/[^\w.\- ]/g, '_').slice(0, 200),
             fileSize: Number(fileSize || 0), fromEmail: user.email,
             toEmail: cleanEmail(body.toEmail || ''),
@@ -530,25 +561,48 @@ async function main() {
             sender: String(sender || user.name || ''), createdAt: Date.now()
           });
         }
-        const transfer = chunkStore.get(transferId);
-        transfer.chunks.set(Number(chunkIndex), Buffer.from(data, 'base64'));
-        // Tous les chunks reçus → assembler le fichier
-        if (transfer.chunks.size === transfer.totalChunks) {
-          const buffers = [];
-          for (let i = 0; i < transfer.totalChunks; i++) buffers.push(transfer.chunks.get(i));
-          const fileBuffer = Buffer.concat(buffers);
-          // Sauvegarder dans MongoDB GridFS (persistant) ou sur disque (fallback local)
-          await store.saveFile(transferId, transfer.fileName, fileBuffer, {
-            fromEmail: transfer.fromEmail, toEmail: transfer.toEmail
-          });
-          const downloadUrl = `/download/${transferId}/${encodeURIComponent(transfer.fileName)}`;
+        const transfer = chunkStore.get(safeTid);
+
+        // Écrire le chunk sur disque (jamais en RAM) → évite le crash mémoire sur Render
+        const chunkBuf = Buffer.from(data, 'base64');
+        fs.writeFileSync(path.join(chunkDir, `chunk_${Number(chunkIndex)}`), chunkBuf);
+        transfer.receivedChunks.add(Number(chunkIndex));
+
+        // Tous les chunks reçus → streamer vers GridFS sans charger tout en RAM
+        if (transfer.receivedChunks.size === transfer.totalChunks) {
+          if (store.saveFileStream) {
+            // MongoStore : stream chunk par chunk vers GridFS
+            const { Readable } = require('stream');
+            const readable = new Readable({ read() {} });
+            const savePromise = store.saveFileStream(safeTid, transfer.fileName, readable, {
+              fromEmail: transfer.fromEmail, toEmail: transfer.toEmail
+            });
+            for (let i = 0; i < transfer.totalChunks; i++) {
+              readable.push(fs.readFileSync(path.join(chunkDir, `chunk_${i}`)));
+            }
+            readable.push(null); // fin du stream
+            await savePromise;
+          } else {
+            // FileStore (fallback local) : lecture complète acceptable en dev
+            const buffers = [];
+            for (let i = 0; i < transfer.totalChunks; i++) {
+              buffers.push(fs.readFileSync(path.join(chunkDir, `chunk_${i}`)));
+            }
+            await store.saveFile(safeTid, transfer.fileName, Buffer.concat(buffers), {
+              fromEmail: transfer.fromEmail, toEmail: transfer.toEmail
+            });
+          }
+          // Nettoyer les fichiers temporaires des chunks
+          try { fs.rmSync(chunkDir, { recursive: true, force: true }); } catch {}
+
+          const downloadUrl = `/download/${safeTid}/${encodeURIComponent(transfer.fileName)}`;
           // Sauvegarder le message dans la DB (sinon il disparaît au history-get)
           const conv = conversationKey(PRESENCE_ROOM, transfer.fromEmail, transfer.toEmail);
           await store.saveMessage({
             type: 'file', conversation: conv, room: PRESENCE_ROOM,
             fromEmail: transfer.fromEmail, fromName: transfer.sender,
             toEmail: transfer.toEmail, text: 'Document envoyé',
-            file: { name: transfer.fileName, size: transfer.fileSize, url: downloadUrl, transferId },
+            file: { name: transfer.fileName, size: transfer.fileSize, url: downloadUrl, transferId: safeTid },
             createdAt: new Date(), time: new Date().toISOString()
           });
           // Chercher le destinataire par email dans toutes les rooms (plus fiable que clientId)
@@ -562,11 +616,11 @@ async function main() {
             }
           }
           if (target) send(target.ws, { type: 'file', sender: transfer.sender, email: transfer.fromEmail,
-            text: 'Document envoyé', file: { name: transfer.fileName, size: transfer.fileSize, url: downloadUrl, transferId } });
-          chunkStore.delete(transferId);
+            text: 'Document envoyé', file: { name: transfer.fileName, size: transfer.fileSize, url: downloadUrl, transferId: safeTid } });
+          chunkStore.delete(safeTid);
           return sendJson(res, 200, { ok: true, complete: true, url: downloadUrl });
         }
-        return sendJson(res, 200, { ok: true, complete: false, received: transfer.chunks.size });
+        return sendJson(res, 200, { ok: true, complete: false, received: transfer.receivedChunks.size });
       } catch (e) {
         console.error('upload-chunk error:', e);
         return sendJson(res, 500, { ok: false, message: e.message });
