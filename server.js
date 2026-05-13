@@ -461,6 +461,7 @@ async function main() {
             chunks: new Map(), totalChunks: Number(totalChunks),
             fileName: String(fileName || 'fichier').replace(/[^\w.\- ]/g, '_').slice(0, 200),
             fileSize: Number(fileSize || 0), fromEmail: user.email,
+            toEmail: cleanEmail(body.toEmail || ''),
             toClientId: String(toClientId || ''), room: String(room || ''),
             sender: String(sender || user.name || ''), createdAt: Date.now()
           });
@@ -476,8 +477,16 @@ async function main() {
           for (let i = 0; i < transfer.totalChunks; i++) buffers.push(transfer.chunks.get(i));
           fs.writeFileSync(filePath, Buffer.concat(buffers));
           const downloadUrl = `/download/${transferId}/${encodeURIComponent(transfer.fileName)}`;
-          // Notifier le destinataire via WebSocket
-          const target = rooms.get(transfer.room)?.get(transfer.toClientId);
+          // Chercher le destinataire par email dans toutes les rooms (plus fiable que clientId)
+          let target = rooms.get(transfer.room)?.get(transfer.toClientId);
+          if (!target && transfer.toEmail) {
+            for (const [, roomMap] of rooms) {
+              for (const [, client] of roomMap) {
+                if (cleanEmail(client.email) === transfer.toEmail) { target = client; break; }
+              }
+              if (target) break;
+            }
+          }
           if (target) send(target.ws, { type: 'file', sender: transfer.sender, email: transfer.fromEmail,
             text: 'Document envoyé', file: { name: transfer.fileName, size: transfer.fileSize, url: downloadUrl, transferId } });
           chunkStore.delete(transferId);
