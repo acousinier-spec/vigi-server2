@@ -278,7 +278,22 @@ class FileStore {
     if (c) c.blocked = !!blocked;
     this.save(); return u.contacts;
   }
-  async saveMessage(msg) { this.db.messages.push(msg); if (this.db.messages.length > 5000) this.db.messages = this.db.messages.slice(-5000); this.save(); return msg; }
+  async saveMessage(msg) {
+    const _id = crypto.randomBytes(12).toString('hex');
+    const saved = { ...msg, _id };
+    this.db.messages.push(saved);
+    if (this.db.messages.length > 5000) this.db.messages = this.db.messages.slice(-5000);
+    this.save(); return saved;
+  }
+  async deleteMessage(msgId, requesterEmail) {
+    const idx = this.db.messages.findIndex(m => String(m._id) === String(msgId));
+    if (idx === -1) return false;
+    const msg = this.db.messages[idx];
+    if (cleanEmail(msg.fromEmail) !== cleanEmail(requesterEmail) && cleanEmail(msg.toEmail) !== cleanEmail(requesterEmail)) return false;
+    this.db.messages.splice(idx, 1);
+    this.save();
+    return { conversation: msg.conversation, fromEmail: msg.fromEmail, toEmail: msg.toEmail };
+  }
   async history(key) { return this.db.messages.filter(m => m.conversation === key).slice(-HISTORY_LIMIT); }
   async deleteMessagesForUserBefore(email, beforeMs) {
     const limit = Number(beforeMs || 0);
@@ -343,18 +358,32 @@ class MongoStore {
     // GridFS bucket pour les fichiers — persistant dans MongoDB Atlas
     const { GridFSBucket } = require('mongodb');
     this.bucket = new GridFSBucket(this.db, { bucketName: 'vigi_files' });
+    // Nettoyage automatique GridFS toutes les heures — supprime les fichiers > 24h
+    const cleanGridFS = async () => {
+      try {
+        const cutoff = new Date(Date.now() - 1 * 60 * 60 * 1000); // 1 heure
+        const old = await this.bucket.find({ uploadDate: { $lt: cutoff } }).toArray();
+        for (const f of old) {
+          try { await this.bucket.delete(f._id); } catch {}
+        }
+        if (old.length) console.log(`GridFS nettoyage : ${old.length} fichier(s) supprimé(s)`);
+      } catch (e) { console.error('GridFS cleanup error:', e.message); }
+    };
+    cleanGridFS(); // nettoyage au démarrage
+    setInterval(cleanGridFS, 60 * 60 * 1000); // puis toutes les heures
   }
-  // Sauvegarde un fichier dans GridFS (survit aux redémarrages Render)
-  async saveFile(transferId, fileName, buffer, metadata = {}) {
+  // Sauvegarde un fichier dans GridFS — accepte un Buffer ou un Readable stream
+  async saveFile(transferId, fileName, bufferOrStream, metadata = {}) {
+    const { pipeline } = require('stream/promises');
+    const { Readable } = require('stream');
     const uploadStream = this.bucket.openUploadStream(fileName, {
       metadata: { transferId, ...metadata, createdAt: new Date() }
     });
-    await new Promise((resolve, reject) => {
-      uploadStream.on('finish', resolve);
-      uploadStream.on('error', reject);
-      uploadStream.write(buffer);
-      uploadStream.end();
-    });
+    const readable = Buffer.isBuffer(bufferOrStream)
+      ? Readable.from(bufferOrStream)
+      : bufferOrStream;
+    // pipeline gère le back-pressure et les erreurs proprement
+    await pipeline(readable, uploadStream);
     // Nettoyer les anciens fichiers du même transferId
     try {
       const old = await this.bucket.find({ 'metadata.transferId': transferId }).toArray();
@@ -366,25 +395,6 @@ class MongoStore {
   async fileExists(transferId, fileName) {
     const files = await this.bucket.find({ 'metadata.transferId': transferId, filename: fileName }).limit(1).toArray();
     return files.length > 0;
-  }
-  // Sauvegarde un fichier depuis un Readable stream vers GridFS (sans charger en RAM)
-  saveFileStream(transferId, fileName, readable, metadata = {}) {
-    return new Promise((resolve, reject) => {
-      const uploadStream = this.bucket.openUploadStream(fileName, {
-        metadata: { transferId, ...metadata, createdAt: new Date() }
-      });
-      readable.pipe(uploadStream);
-      uploadStream.on('finish', async () => {
-        // Nettoyer les anciens fichiers du même transferId
-        try {
-          const old = await this.bucket.find({ 'metadata.transferId': transferId }).toArray();
-          for (const f of old) if (String(f._id) !== String(uploadStream.id)) await this.bucket.delete(f._id);
-        } catch {}
-        resolve(uploadStream.id);
-      });
-      uploadStream.on('error', reject);
-      readable.on('error', reject);
-    });
   }
   // Stream un fichier depuis GridFS vers la réponse HTTP
   streamFile(transferId, fileName, res) {
@@ -430,7 +440,16 @@ class MongoStore {
     await this.users.updateOne({ email }, { $set: { contacts } });
     return contacts;
   }
-  async saveMessage(msg) { await this.messages.insertOne(msg); return msg; }
+  async saveMessage(msg) { const result = await this.messages.insertOne(msg); return { ...msg, _id: result.insertedId }; }
+  async deleteMessage(msgId, requesterEmail) {
+    const { ObjectId } = require('mongodb');
+    let oid; try { oid = new ObjectId(String(msgId)); } catch { return false; }
+    const msg = await this.messages.findOne({ _id: oid });
+    if (!msg) return false;
+    if (cleanEmail(msg.fromEmail) !== cleanEmail(requesterEmail) && cleanEmail(msg.toEmail) !== cleanEmail(requesterEmail)) return false;
+    await this.messages.deleteOne({ _id: oid });
+    return { conversation: msg.conversation, fromEmail: msg.fromEmail, toEmail: msg.toEmail };
+  }
   async history(key) { return await this.messages.find({ conversation: key }).sort({ createdAt: -1 }).limit(HISTORY_LIMIT).toArray().then(a => a.reverse()); }
   async deleteMessagesForUserBefore(email, beforeMs) {
     const e = cleanEmail(email);
@@ -508,11 +527,10 @@ async function main() {
   store = await initStore();
 
   // --- Stockage temporaire pour les transferts de fichiers par chunks ---
-  // Les chunks sont ecrits sur disque (pas en RAM) pour eviter les crashes memoire sur Render
+  // Chaque chunk est écrit sur disque (pas en RAM) pour éviter les crashes mémoire sur Render
   const UPLOAD_DIR = path.join(__dirname, 'vigi-uploads');
   if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   const chunkStore = new Map(); // transferId -> { receivedChunks: Set, totalChunks, fileName, ... }
-  // Nettoyage automatique toutes les heures (fichiers > 24h supprimes)
   setInterval(() => {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     for (const [tid, info] of chunkStore) {
@@ -546,7 +564,6 @@ async function main() {
         if (!transferId || chunkIndex == null || !totalChunks || !data)
           return sendJson(res, 400, { ok: false, message: 'Paramètres manquants' });
 
-        // Sécuriser le transferId pour l'utiliser comme nom de dossier
         const safeTid = String(transferId).replace(/[^a-zA-Z0-9\-_]/g, '').slice(0, 64);
         const chunkDir = path.join(UPLOAD_DIR, safeTid);
 
@@ -563,40 +580,26 @@ async function main() {
         }
         const transfer = chunkStore.get(safeTid);
 
-        // Écrire le chunk sur disque (jamais en RAM) → évite le crash mémoire sur Render
-        const chunkBuf = Buffer.from(data, 'base64');
-        fs.writeFileSync(path.join(chunkDir, `chunk_${Number(chunkIndex)}`), chunkBuf);
+        // Écrire le chunk sur disque — jamais en RAM
+        fs.writeFileSync(path.join(chunkDir, `chunk_${Number(chunkIndex)}`), Buffer.from(data, 'base64'));
         transfer.receivedChunks.add(Number(chunkIndex));
 
-        // Tous les chunks reçus → streamer vers GridFS sans charger tout en RAM
+        // Tous les chunks reçus → streamer vers GridFS chunk par chunk (back-pressure respecté)
         if (transfer.receivedChunks.size === transfer.totalChunks) {
-          if (store.saveFileStream) {
-            // MongoStore : stream chunk par chunk vers GridFS
-            const { Readable } = require('stream');
-            const readable = new Readable({ read() {} });
-            const savePromise = store.saveFileStream(safeTid, transfer.fileName, readable, {
-              fromEmail: transfer.fromEmail, toEmail: transfer.toEmail
-            });
+          const { Readable } = require('stream');
+          // Async generator : un seul chunk en mémoire à la fois, attend que GridFS soit prêt
+          async function* readChunks() {
             for (let i = 0; i < transfer.totalChunks; i++) {
-              readable.push(fs.readFileSync(path.join(chunkDir, `chunk_${i}`)));
+              yield await fs.promises.readFile(path.join(chunkDir, `chunk_${i}`));
             }
-            readable.push(null); // fin du stream
-            await savePromise;
-          } else {
-            // FileStore (fallback local) : lecture complète acceptable en dev
-            const buffers = [];
-            for (let i = 0; i < transfer.totalChunks; i++) {
-              buffers.push(fs.readFileSync(path.join(chunkDir, `chunk_${i}`)));
-            }
-            await store.saveFile(safeTid, transfer.fileName, Buffer.concat(buffers), {
-              fromEmail: transfer.fromEmail, toEmail: transfer.toEmail
-            });
           }
-          // Nettoyer les fichiers temporaires des chunks
+          await store.saveFile(safeTid, transfer.fileName, Readable.from(readChunks()), {
+            fromEmail: transfer.fromEmail, toEmail: transfer.toEmail
+          });
+          // Nettoyer les fichiers temporaires
           try { fs.rmSync(chunkDir, { recursive: true, force: true }); } catch {}
 
           const downloadUrl = `/download/${safeTid}/${encodeURIComponent(transfer.fileName)}`;
-          // Sauvegarder le message dans la DB (sinon il disparaît au history-get)
           const conv = conversationKey(PRESENCE_ROOM, transfer.fromEmail, transfer.toEmail);
           await store.saveMessage({
             type: 'file', conversation: conv, room: PRESENCE_ROOM,
@@ -605,7 +608,6 @@ async function main() {
             file: { name: transfer.fileName, size: transfer.fileSize, url: downloadUrl, transferId: safeTid },
             createdAt: new Date(), time: new Date().toISOString()
           });
-          // Chercher le destinataire par email dans toutes les rooms (plus fiable que clientId)
           let target = rooms.get(transfer.room)?.get(transfer.toClientId);
           if (!target && transfer.toEmail) {
             for (const [, roomMap] of rooms) {
@@ -831,6 +833,21 @@ async function main() {
           const removed = await store.deleteMessagesForUserBefore(client.user.email, before);
           return send(ws, { type: 'messages-cleared', before, removed });
         }
+        if (msg.type === 'message-delete') {
+          const result = await store.deleteMessage(msg.messageId, client.user.email);
+          if (!result) return send(ws, { type: 'error', message: 'Message introuvable ou non autorisé.' });
+          // Notifier les deux côtés
+          const notif = { type: 'message-deleted', messageId: String(msg.messageId), conversation: result.conversation };
+          send(ws, notif);
+          const otherEmail = cleanEmail(result.fromEmail) === cleanEmail(client.user.email) ? result.toEmail : result.fromEmail;
+          for (const [, roomMap] of rooms) {
+            for (const [, c] of roomMap) {
+              if (cleanEmail(c.email) === cleanEmail(otherEmail)) { send(c.ws, notif); break; }
+            }
+          }
+          return;
+        }
+
         if (msg.type === 'history-get') {
           const key = safeString(msg.conversation || conversationKey(safeString(msg.room, client.room || 'levigilant'), client.email, cleanEmail(msg.targetEmail)));
           return send(ws, { type: 'message-history', conversation: key, messages: await store.history(key) });
@@ -864,8 +881,9 @@ async function main() {
             toEmail: targetEmail || '', text: String(msg.text || '').slice(0, 5000), file: msg.file || null,
             createdAt: new Date(), time: new Date().toISOString()
           };
-          await store.saveMessage(saved);
+          const savedMsg = await store.saveMessage(saved);
           payload.conversation = conv;
+          payload._id = String(savedMsg._id || '');
         }
 
         if (msg.to) {
